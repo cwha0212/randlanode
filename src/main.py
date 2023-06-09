@@ -54,14 +54,11 @@ class SST :
   def get_batch_gen(self):
     num_per_epoch = 4
 
-    print("get_batch")
     def spatially_regular_gen():
       # Generator loop
-      print("spatially")
       self.possibility = [np.random.rand(self.points.shape[0]) * 1e-3]
       self.min_possibility = [float(np.min(self.possibility[-1]))]
       for i in range(num_per_epoch):
-        print("?")
         cloud_ind = int(np.argmin(self.min_possibility))
         pick_idx = np.argmin(self.possibility[cloud_ind])
         pc = np.array(self.search_tree.data, copy=False)
@@ -73,8 +70,6 @@ class SST :
         # update the possibility of the selected pc
         dists = np.sum(np.square((selected_pc - pc[pick_idx]).astype(np.float32)), axis=1)
         delta = np.square(1 - dists / np.max(dists))
-        print(pc.shape)
-        print(pick_idx)
         self.possibility[cloud_ind][selected_idx] += delta
         self.min_possibility[cloud_ind] = np.min(self.possibility[cloud_ind])
 
@@ -94,10 +89,7 @@ class SST :
   def crop_pc(points, labels, search_tree, pick_idx):
     # crop a fixed size point cloud for training
     center_point = points[pick_idx, :].reshape(1, -1)
-    print(center_point)
     select_idx = search_tree.query(center_point, k=cfg.num_points)[1][0]
-    print(select_idx)
-    print(max(select_idx))
     select_idx = DP.shuffle_idx(select_idx)
     select_points = points[select_idx]
     select_labels = labels[select_idx]
@@ -144,6 +136,7 @@ class SST :
 
   def pointcloud_callback(self, msg):
       print('point cloud in!')
+      start = rospy.Time.now()
       points = []
       for data in pc2.read_points(msg, field_names=("x","y","z",), skip_nans=True):
         points = np.append(points, np.array([data[0],data[1],data[2]]))
@@ -166,11 +159,9 @@ class SST :
                 self.model.labels,
                 self.model.inputs['input_inds'],
                 self.model.inputs['cloud_inds'])
-          print("ops")
           stacked_probs, labels, point_inds, cloud_inds = self.sess.run(ops, {self.model.is_training: False})
           self.test_probs = [np.zeros(shape=[len(l), self.model.config.num_classes], dtype=np.float16)
                                     for l in self.possibility]
-          print('step ' + str(self.idx))
           self.idx += 1
           stacked_probs = np.reshape(stacked_probs, [self.model.config.val_batch_size,
                                                     self.model.config.num_points,
@@ -184,8 +175,6 @@ class SST :
 
         except tf.errors.OutOfRangeError:
           new_min = np.min(self.min_possibility)
-          print('\nReproject Vote #{:d}'.format(int(np.floor(new_min))))
-
           for j in range(len(self.test_probs)):
             proj_inds = self.proj_inds
             probs = self.test_probs[j][proj_inds[0], :]
@@ -197,7 +186,6 @@ class SST :
             lower_half = self.remap_lut[lower_half]  # do the remapping of semantics
             pred = (upper_half << 16) + lower_half  # reconstruct full label
             pred = pred.astype(np.uint32)
-          print("something happen")
           kickboards = []
           for i, point in enumerate(points):
             x = float(point[0])
@@ -218,6 +206,9 @@ class SST :
           pc_kickboards = pc2.create_cloud(self.header, self.fields, kickboards)
           self.pub.publish(pc_kickboards)
           print("pub")
+          end = rospy.Time.now()
+          time = (end - start).to_sec()
+          print("time : ", time)
           break
 
   def start_tester(self, model):
@@ -237,7 +228,9 @@ def main(args=None):
   model = Network(dataset, cfg)
   dataset.start_tester(model)
   cfg.saving = False
-  print("ready")
+  print("----------------------------------------")
+  print("ready to segmentation!")
+  print("----------------------------------------")
   rospy.init_node('pointcloud_subscriber')
   sub = rospy.Subscriber('/ouster/points', PointCloud2, dataset.pointcloud_callback)
   rospy.spin()
