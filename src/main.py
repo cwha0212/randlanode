@@ -1,8 +1,7 @@
-#!/home/chang/anaconda3/envs/randlanet2/bin/python
+#!/usr/bin/env python
 from __future__ import print_function
 
 import sys
-sys.path.append('/home/chang/catkin_ws/src/randlanode/src')
 import rospy
 import sensor_msgs.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2, PointField
