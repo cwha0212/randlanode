@@ -15,6 +15,7 @@ import os
 from helper_tool import ConfigSST as cfg
 from RandLANet import Network
 import pickle
+from threading import Lock
 
 class SST :
   def __init__(self):
@@ -25,9 +26,9 @@ class SST :
     self.label_values = np.sort([k for k, v in self.label_to_names.items()])
     self.label_to_idx = {l: i for i, l in enumerate(self.label_values)}
     self.ignored_labels = np.array([])
-    self.points = np.load("/home/chang/data/11/velodyne/0_00000.npy")
+    self.points = np.load("./init/0_00000.npy")
     self.search_tree = KDTree(self.points)
-    with open("/home/chang/data/11/proj/0_00000_proj.pkl", 'rb') as f:
+    with open("./init/0_00000_proj.pkl", 'rb') as f:
       self.proj_inds = pickle.load(f)
     self.possibility = []
     self.min_possibility = []
@@ -48,8 +49,11 @@ class SST :
           PointField('rgba', 24, PointField.UINT32, 1),
           ]
     self.header = Header()
-    self.header.frame_id = "map"
-    self.pub = rospy.Publisher('/kickboard', PointCloud2,queue_size=100)
+    self.header.frame_id = "os_sensor"
+    self.pub = rospy.Publisher('/kickboard', PointCloud2,queue_size=1)
+    self.process = False
+    self.mutex = Lock()  # Mutex 생성
+
 
   def get_batch_gen(self):
     num_per_epoch = 4
@@ -57,11 +61,9 @@ class SST :
     print("get_batch")
     def spatially_regular_gen():
       # Generator loop
-      print("spatially")
       self.possibility = [np.random.rand(self.points.shape[0]) * 1e-3]
       self.min_possibility = [float(np.min(self.possibility[-1]))]
       for i in range(num_per_epoch):
-        print("?")
         cloud_ind = int(np.argmin(self.min_possibility))
         pick_idx = np.argmin(self.possibility[cloud_ind])
         pc = np.array(self.search_tree.data, copy=False)
@@ -73,8 +75,6 @@ class SST :
         # update the possibility of the selected pc
         dists = np.sum(np.square((selected_pc - pc[pick_idx]).astype(np.float32)), axis=1)
         delta = np.square(1 - dists / np.max(dists))
-        print(pc.shape)
-        print(pick_idx)
         self.possibility[cloud_ind][selected_idx] += delta
         self.min_possibility[cloud_ind] = np.min(self.possibility[cloud_ind])
 
@@ -94,10 +94,7 @@ class SST :
   def crop_pc(points, labels, search_tree, pick_idx):
     # crop a fixed size point cloud for training
     center_point = points[pick_idx, :].reshape(1, -1)
-    print(center_point)
     select_idx = search_tree.query(center_point, k=cfg.num_points)[1][0]
-    print(select_idx)
-    print(max(select_idx))
     select_idx = DP.shuffle_idx(select_idx)
     select_points = points[select_idx]
     select_labels = labels[select_idx]
@@ -143,82 +140,91 @@ class SST :
     self.test_init_op = iter.make_initializer(self.batch_test_data)
 
   def pointcloud_callback(self, msg):
-      print('point cloud in!')
-      points = []
-      for data in pc2.read_points(msg, field_names=("x","y","z",), skip_nans=True):
-        points = np.append(points, np.array([data[0],data[1],data[2]]))
-      points = points.reshape((-1, 3))
-      points = points.astype(np.float32)
-      sub_points = DP.grid_sub_sampling(points, grid_size=0.06)
-      search_tree = KDTree(sub_points)
-      proj_inds = np.squeeze(search_tree.query(points, return_distance=False))
-      proj_inds = proj_inds.astype(np.int32)
-      self.points = sub_points
-      self.search_tree = search_tree
-      self.proj_inds = [proj_inds]
-      self.sess.run(self.test_init_op)
-      
-      test_smooth = 0.98
-      epoch_ind = 0
-      while True:
-        try:
-          ops = (self.prob_logits,
-                self.model.labels,
-                self.model.inputs['input_inds'],
-                self.model.inputs['cloud_inds'])
-          print("ops")
-          stacked_probs, labels, point_inds, cloud_inds = self.sess.run(ops, {self.model.is_training: False})
-          self.test_probs = [np.zeros(shape=[len(l), self.model.config.num_classes], dtype=np.float16)
-                                    for l in self.possibility]
-          print('step ' + str(self.idx))
-          self.idx += 1
-          stacked_probs = np.reshape(stacked_probs, [self.model.config.val_batch_size,
-                                                    self.model.config.num_points,
-                                                    self.model.config.num_classes])
-          for j in range(np.shape(stacked_probs)[0]):
-            probs = stacked_probs[j, :, :]
-            inds = point_inds[j, :]
-            c_i = cloud_inds[j][0]
-            self.test_probs[c_i][inds] = test_smooth * self.test_probs[c_i][inds] + (1 - test_smooth) * probs
+      if self.process == True:
+        print(self.process)
+        return
+      self.process = True
+
+      try:
+        print('point cloud in!')
+        points = []
+        for data in pc2.read_points(msg, field_names=("x","y","z",), skip_nans=True):
+          points = np.append(points, np.array([data[0],data[1],data[2]]))
+        points = points.reshape((-1, 3))
+        points = points.astype(np.float32)
+        sub_points = DP.grid_sub_sampling(points, grid_size=0.06)
+        search_tree = KDTree(sub_points)
+        proj_inds = np.squeeze(search_tree.query(points, return_distance=False))
+        proj_inds = proj_inds.astype(np.int32)
+        self.points = sub_points
+        self.search_tree = search_tree
+        self.proj_inds = [proj_inds]
+        self.sess.run(self.test_init_op)
+        
+        test_smooth = 0.98
+        epoch_ind = 0
+        while True:
+          try:
+            ops = (self.prob_logits,
+                  self.model.labels,
+                  self.model.inputs['input_inds'],
+                  self.model.inputs['cloud_inds'])
+            stacked_probs, labels, point_inds, cloud_inds = self.sess.run(ops, {self.model.is_training: False})
+            self.test_probs = [np.zeros(shape=[len(l), self.model.config.num_classes], dtype=np.float16)
+                                      for l in self.possibility]
+            self.idx += 1
+            stacked_probs = np.reshape(stacked_probs, [self.model.config.val_batch_size,
+                                                      self.model.config.num_points,
+                                                      self.model.config.num_classes])
+            for j in range(np.shape(stacked_probs)[0]):
+              probs = stacked_probs[j, :, :]
+              inds = point_inds[j, :]
+              c_i = cloud_inds[j][0]
+              self.test_probs[c_i][inds] = test_smooth * self.test_probs[c_i][inds] + (1 - test_smooth) * probs
 
 
-        except tf.errors.OutOfRangeError:
-          new_min = np.min(self.min_possibility)
-          print('\nReproject Vote #{:d}'.format(int(np.floor(new_min))))
+          except tf.errors.OutOfRangeError:
+            new_min = np.min(self.min_possibility)
+            print('\nReproject Vote #{:d}'.format(int(np.floor(new_min))))
 
-          for j in range(len(self.test_probs)):
-            proj_inds = self.proj_inds
-            probs = self.test_probs[j][proj_inds[0], :]
-            pred = np.argmax(probs, 1)
-            pred = pred + 1
-            pred = pred.astype(np.uint32)
-            upper_half = pred >> 16  # get upper half for instances
-            lower_half = pred & 0xFFFF  # get lower half for semantics
-            lower_half = self.remap_lut[lower_half]  # do the remapping of semantics
-            pred = (upper_half << 16) + lower_half  # reconstruct full label
-            pred = pred.astype(np.uint32)
-          print("something happen")
-          kickboards = []
-          for i, point in enumerate(points):
-            x = float(point[0])
-            y = float(point[1])
-            z = float(point[2])
-            if int(pred[i]) == 1:
-              r = 255
-              g = 0
-              b = 0
-            if int(pred[i]) == 0:
-              r = 0
-              g = 255
-              b = 0
-            a = 255
-            rgb = struct.unpack('I', struct.pack('BBBB', b, g, r, a))[0]
-            pt = [x, y, z, rgb]
-            kickboards.append(pt)
-          pc_kickboards = pc2.create_cloud(self.header, self.fields, kickboards)
-          self.pub.publish(pc_kickboards)
-          print("pub")
-          break
+            for j in range(len(self.test_probs)):
+              proj_inds = self.proj_inds
+              probs = self.test_probs[j][proj_inds[0], :]
+              pred = np.argmax(probs, 1)
+              pred = pred + 1
+              pred = pred.astype(np.uint32)
+              upper_half = pred >> 16  # get upper half for instances
+              lower_half = pred & 0xFFFF  # get lower half for semantics
+              lower_half = self.remap_lut[lower_half]  # do the remapping of semantics
+              pred = (upper_half << 16) + lower_half  # reconstruct full label
+              pred = pred.astype(np.uint32)
+            kickboards = []
+            for i, point in enumerate(points):
+              x = float(point[0])
+              y = float(point[1])
+              z = float(point[2])
+              # if int(pred[i]) == 1:
+              #   print(1)
+              #   r = 255
+              #   g = 0
+              #   b = 0
+              if int(pred[i]) == 0:
+                r = 255
+                g = 255
+                b = 255
+                a = 255
+                rgb = struct.unpack('I', struct.pack('BBBB', b, g, r, a))[0]
+                pt = [x, y, z, rgb]
+                kickboards.append(pt)
+            pc_kickboards = pc2.create_cloud(self.header, self.fields, kickboards)
+            self.pub.publish(pc_kickboards)
+            print("pub")
+            self.process = False
+            break
+      except Exception as e:
+            # 예외가 발생한 경우에도 프로세스 변수를 다시 False로 설정하여 안전하게 종료
+            print("Error in pointcloud_callback:", e)
+            self.process = False
 
   def start_tester(self, model):
     my_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
@@ -239,7 +245,7 @@ def main(args=None):
   cfg.saving = False
   print("ready")
   rospy.init_node('pointcloud_subscriber')
-  sub = rospy.Subscriber('/ouster/points', PointCloud2, dataset.pointcloud_callback)
+  rospy.Subscriber('/ouster/points', PointCloud2, dataset.pointcloud_callback, queue_size=1)
   rospy.spin()
 
 if __name__ == '__main__':
